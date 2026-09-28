@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine
+from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from . import config
@@ -24,6 +24,10 @@ class Job(Base):
     github_url = Column(String, nullable=True)
     error = Column(Text, nullable=True)
     plan_json = Column(Text, nullable=True)  # plan contains no secret values
+    mode = Column(String, default="new")  # "new" repository or "update" existing one
 
 
 Base.metadata.create_all(engine)
+if "mode" not in {c["name"] for c in inspect(engine).get_columns("jobs")}:
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE jobs ADD COLUMN mode VARCHAR DEFAULT 'new'"))

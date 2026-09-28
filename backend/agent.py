@@ -6,7 +6,7 @@ from groq import APIConnectionError, APIError, AuthenticationError, Groq, RateLi
 from pydantic import ValidationError
 
 from . import config
-from .schemas import Plan, validate_plan
+from .schemas import META_FILES, Plan, validate_plan
 
 SYSTEM = """You are RepoPilot's planning agent. You only make decisions; the backend performs every action.
 Workflow: call scan_folder, then scan_for_secrets, then propose_plan, then generate_readme, then reply DONE.
@@ -14,6 +14,11 @@ Rules: use only file paths returned by scan_folder. Every file must be in exactl
 .gitignore or LICENSE in commits. Create 3-8 logical commits with Conventional Commit messages (chore/feat/fix/docs/test),
 ordered from scaffolding and config to features to docs. Never guess or invent secrets. If propose_plan returns an error, fix it and call it again.
 gitignore must suit the detected stack. license is "MIT" or "none"."""
+
+SYSTEM_UPDATE = """You are RepoPilot's planning agent for an EXISTING GitHub repository. The user changed files locally; you only make decisions, the backend performs every action.
+Workflow: call scan_folder (changed files with status M=modified, A or ?=new, D=deleted, plus diffs), then scan_for_secrets, then propose_plan, then reply DONE. Do not call generate_readme.
+Group the changes into 1-5 logical commits with Conventional Commit messages that describe what changed (use the diffs). Every changed file, including deleted ones, must be in exactly one commit.
+Use only paths from scan_folder. Leave gitignore empty and license "none". Never guess or invent secrets."""
 
 COMMIT_SCHEMA = {"type": "object", "properties": {"message": {"type": "string"}, "files": {"type": "array", "items": {"type": "string"}},
                                                    "reason": {"type": "string"}}, "required": ["message", "files", "reason"]}
@@ -28,7 +33,7 @@ TOOLS = [
             "visibility": {"type": "string", "enum": ["public", "private"]}, "commits": {"type": "array", "items": COMMIT_SCHEMA},
             "gitignore": {"type": "string"}, "license": {"type": "string", "enum": ["MIT", "none"]},
             "warnings": {"type": "array", "items": {"type": "string"}}},
-        "required": ["repo_name", "description", "topics", "visibility", "commits", "gitignore", "license"]}}},
+        "required": ["repo_name", "description", "topics", "visibility", "commits"]}}},
     {"type": "function", "function": {"name": "generate_readme", "description": "Generate the README.md for the project.",
                                       "parameters": {"type": "object", "properties": {}}}},
 ]
@@ -39,8 +44,10 @@ class AgentError(Exception):
 
 
 class Agent:
-    def __init__(self, scan: dict, repo_name: str, description: str, visibility: str, log: Callable[[str], None]):
+    def __init__(self, scan: dict, repo_name: str, description: str, visibility: str, log: Callable[[str], None], update: bool = False):
         self.scan, self.repo_name, self.description, self.visibility, self.log = scan, repo_name, description, visibility, log
+        self.update = update
+        self.tools = [t for t in TOOLS if not (update and t["function"]["name"] == "generate_readme")]
         self.allowed = {f["path"] for f in scan["files"]}
         self.blocked = {b["path"] for b in scan["blocked"]}
         self.plan: Plan | None = None
@@ -69,7 +76,7 @@ class Agent:
     def _summary(self) -> dict:
         s = self.scan
         return {"languages": s["languages"], "frameworks": s["frameworks"], "package_managers": s["package_managers"],
-                "files": [[f["path"], f["size"]] for f in s["files"][:1500]], "truncated": s["truncated"],
+                "files": [[f["path"], f["size"], f.get("status", "")] for f in s["files"][:1500]], "truncated": s["truncated"],
                 "has_readme": s["has_readme"], "has_gitignore": s["has_gitignore"], "has_license": s["has_license"]}
 
     def _tool(self, name: str, args: dict) -> dict:
@@ -83,7 +90,8 @@ class Agent:
             self.log("Generating plan")
             try:
                 plan = Plan(**{**args, "readme": ""})
-                self.plan = validate_plan(plan, self.allowed, self.blocked, autofill=True)
+                self.plan = validate_plan(plan, self.allowed, self.blocked, autofill=True,
+                                          meta=set() if self.update else META_FILES)
             except (ValidationError, ValueError, TypeError) as e:
                 return {"error": str(e)[:800]}
             return {"ok": True, "commits": len(self.plan.commits)}
@@ -100,12 +108,12 @@ class Agent:
     def run(self) -> Plan:
         if not self.allowed:
             raise AgentError("No pushable files were found in this folder.")
-        messages: list[dict] = [{"role": "system", "content": SYSTEM},
+        messages: list[dict] = [{"role": "system", "content": SYSTEM_UPDATE if self.update else SYSTEM},
                                 {"role": "user", "content": json.dumps({"repo_name": self.repo_name, "description": self.description,
                                                                         "visibility": self.visibility})}]
         calls = 0
         for _ in range(config.MAX_AGENT_TOOL_CALLS + 3):
-            msg = self._chat(messages=messages, tools=TOOLS, tool_choice="auto").choices[0].message
+            msg = self._chat(messages=messages, tools=self.tools, tool_choice="auto").choices[0].message
             if not msg.tool_calls:
                 break
             messages.append({"role": "assistant", "content": msg.content or "", "tool_calls": [
@@ -121,12 +129,12 @@ class Agent:
                 except json.JSONDecodeError:
                     result = {"error": "Arguments were not valid JSON. Call the tool again with valid JSON."}
                 messages.append({"role": "tool", "tool_call_id": t.id, "content": json.dumps(result)})
-            if self.plan and self.readme:
+            if self.plan and (self.update or self.readme):
                 break
         if not self.plan:
             raise AgentError("The AI did not return a valid plan. Try again.")
         return self.plan.model_copy(update={
             "repo_name": self.repo_name, "visibility": self.visibility,
             "description": self.description or self.plan.description,
-            "readme": self.readme or f"# {self.repo_name}\n\n{self.description}\n",
+            "readme": "" if self.update else (self.readme or f"# {self.repo_name}\n\n{self.description}\n"),
             "warnings": self.plan.warnings + ([f"{len(self.blocked)} sensitive file(s) were excluded from the push."] if self.blocked else [])})

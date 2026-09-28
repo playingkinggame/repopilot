@@ -35,10 +35,15 @@ def need(db: Session, job_id: str) -> Job:
     return job
 
 
-def get_scan(job_id: str, folder: str) -> dict:
-    if job_id not in _scans:
-        _scans[job_id] = scan_folder(Path(folder))
-    return _scans[job_id]
+def do_scan(job: Job) -> dict:
+    s = scan_folder(Path(job.folder))
+    return gitops.restrict_to_changes(Path(job.folder), s) if job.mode == "update" else s
+
+
+def get_scan(job: Job) -> dict:
+    if job.id not in _scans:
+        _scans[job.id] = do_scan(job)
+    return _scans[job.id]
 
 
 def sets(s: dict) -> tuple[set[str], set[str]]:
@@ -52,15 +57,25 @@ def iso(d: datetime | None) -> str | None:
 def job_out(job: Job, detail: bool = False) -> dict:
     d = {"id": job.id, "folder": job.folder, "repo_name": job.repo_name, "description": job.description or "",
          "visibility": job.visibility, "status": job.status, "commits": job.commits or 0, "created_at": iso(job.created_at),
-         "completed_at": iso(job.completed_at), "github_url": job.github_url, "error": job.error}
+         "completed_at": iso(job.completed_at), "github_url": job.github_url, "error": job.error, "mode": job.mode or "new"}
     if detail:
+        update = job.mode == "update"
         try:
-            s = get_scan(job.id, job.folder)
-        except OSError:
+            s = get_scan(job)
+        except (OSError, gitops.GitError):
             s = {"files": [], "blocked": [], "findings": []}
+        meta = set() if update else META_FILES
         d["plan"] = json.loads(job.plan_json) if job.plan_json else None
         d["security"] = {"blocked": s["blocked"], "findings": s["findings"]}
-        d["available_files"] = sorted(f["path"] for f in s["files"] if f["path"] not in META_FILES)
+        d["available_files"] = sorted(f["path"] for f in s["files"] if f["path"] not in meta)
+        d["sync"] = None
+        if update:
+            try:
+                i = gitops.repo_info(Path(job.folder))
+                d["sync"] = {"owner": i["owner"], "name": i["name"], "branch": i["branch"], "ahead": i["ahead"],
+                             "changes": s.get("changes", [])}
+            except gitops.GitError:
+                pass
     return d
 
 
@@ -89,14 +104,34 @@ def settings():
             "github_configured": bool(config.GITHUB_TOKEN)}
 
 
+@app.get("/api/inspect")
+def inspect_folder(folder: str):
+    try:
+        f = resolve_folder(folder)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
+    try:
+        i = gitops.repo_info(f)
+        n = len(gitops.changes(f))
+    except gitops.GitError as e:
+        return {"is_repo": False, "reason": str(e)}
+    return {"is_repo": True, "owner": i["owner"], "name": i["name"], "branch": i["branch"], "ahead": i["ahead"], "changed": n}
+
+
 @app.post("/api/jobs", status_code=201)
 def create_job(body: JobCreate, db: Session = Depends(get_db)):
     try:
         folder = resolve_folder(body.folder)
     except ValueError as e:
         raise HTTPException(400, str(e)) from None
-    job = Job(id=uuid.uuid4().hex[:12], folder=str(folder), repo_name=body.repo_name, description=body.description,
-              visibility=body.visibility, status="CREATED")
+    name = body.repo_name
+    if body.mode == "update":
+        try:
+            name = gitops.repo_info(folder)["name"]
+        except gitops.GitError as e:
+            raise HTTPException(400, f"{e} Use 'New repository' mode instead.") from None
+    job = Job(id=uuid.uuid4().hex[:12], folder=str(folder), repo_name=name, description=body.description,
+              visibility=body.visibility, status="CREATED", mode=body.mode)
     db.add(job)
     db.commit()
     return job_out(job)
@@ -122,28 +157,41 @@ def scan_job(job_id: str, db: Session = Depends(get_db)):
     db.commit()
     events.emit(job_id, "plan", "log", "Scanning folder")
     try:
-        s = scan_folder(Path(job.folder))
-    except OSError:
-        job.status, job.error = "FAILED", "The folder could not be read."
+        s = do_scan(job)
+        ahead = gitops.repo_info(Path(job.folder))["ahead"] if job.mode == "update" else 0
+    except (OSError, gitops.GitError) as e:
+        job.status = "FAILED"
+        job.error = str(e) if isinstance(e, gitops.GitError) else "The folder could not be read."
         db.commit()
         raise HTTPException(400, job.error) from None
     _scans[job_id] = s
-    events.emit(job_id, "plan", "log", f"Security scan: {len(s['blocked'])} sensitive file(s) excluded, {len(s['files'])} safe file(s) found")
-    job.status = "CREATED" if s["files"] else "BLOCKED"
-    job.error = None if s["files"] else "No pushable files were found in this folder."
+    events.emit(job_id, "plan", "log", f"Security scan: {len(s['blocked'])} sensitive file(s) excluded, {len(s['files'])} file(s) ready")
+    ok = bool(s["files"]) or ahead > 0
+    job.status = "CREATED" if ok else "BLOCKED"
+    job.error = None if ok else ("Nothing to push: no uncommitted changes and no unpushed commits." if job.mode == "update"
+                                 else "No pushable files were found in this folder.")
     db.commit()
     return job_out(job, detail=True)
 
 
 def run_plan(job_id: str) -> None:
+    def log(m: str) -> None:
+        events.emit(job_id, "plan", "log", m)
+
     try:
         with SessionLocal() as db:
             job = db.get(Job, job_id)
-            folder, name, desc, vis = job.folder, job.repo_name, job.description or "", job.visibility
-        plan = Agent(get_scan(job_id, folder), name, desc, vis, lambda m: events.emit(job_id, "plan", "log", m)).run()
+        s = get_scan(job)
+        if job.mode == "update":
+            info = gitops.repo_info(Path(job.folder))
+            plan = (Agent(s, job.repo_name, "", "private", log, update=True).run() if s["files"]
+                    else Plan(repo_name=job.repo_name, commits=[]))  # only already-committed work to push
+            plan = plan.model_copy(update={"branch": info["branch"]})
+        else:
+            plan = Agent(s, job.repo_name, job.description or "", job.visibility, log).run()
         set_job(job_id, status="REVIEW", plan_json=plan.model_dump_json(), commits=len(plan.commits), error=None)
         events.emit(job_id, "plan", "plan_ready", "Plan ready for review")
-    except AgentError as e:
+    except (AgentError, gitops.GitError) as e:
         fail("plan", job_id, str(e))
     except Exception:
         fail("plan", job_id, "Unexpected error while generating the plan.")
@@ -171,9 +219,12 @@ def put_plan(job_id: str, plan: Plan, db: Session = Depends(get_db)):
     job = need(db, job_id)
     if job.status != "REVIEW":
         raise HTTPException(409, "The plan can only be edited during review.")
-    allowed, blocked = sets(get_scan(job_id, job.folder))
+    update = job.mode == "update"
+    allowed, blocked = sets(get_scan(job))
     try:
-        plan = validate_plan(plan, allowed, blocked)
+        plan = validate_plan(plan, allowed, blocked, meta=set() if update else META_FILES, allow_empty=update)
+        if update and not plan.branch:
+            raise ValueError("Enter the branch to push to.")
     except ValueError as e:
         raise HTTPException(422, str(e)) from None
     job.plan_json, job.commits = plan.model_dump_json(), len(plan.commits)
@@ -187,13 +238,34 @@ def approve_job(job_id: str, body: ApproveIn, db: Session = Depends(get_db)):
     job = need(db, job_id)
     if job.status != "REVIEW" or not job.plan_json:
         raise HTTPException(409, "There is no plan waiting for approval.")
-    if get_scan(job_id, job.folder)["blocked"] and not body.acknowledge_warnings:
+    if get_scan(job)["blocked"] and not body.acknowledge_warnings:
         raise HTTPException(400, "Acknowledge the security warning before approving.")
     events.clear(job_id, "push")
     job.status = "APPROVED"
     db.commit()
     events.emit(job_id, "push", "log", "Plan approved")
     return job_out(job)
+
+
+def push_update(job_id: str, folder: Path, plan: Plan, log) -> None:
+    """Commit local changes and push them to the existing GitHub repository (never force-pushes)."""
+    info = gitops.repo_info(folder)
+    log(f"Checking GitHub for newer commits on {plan.branch}")
+    n = gitops.behind(folder, info["clone_url"], plan.branch)
+    if n:
+        raise gitops.GitError(f"GitHub has {n} newer commit(s) on '{plan.branch}'. Pull them in VS Code first, then run RepoPilot again.")
+    gitops.reset_index(folder)
+    made = 0
+    for i, c in enumerate(plan.commits, 1):
+        log(f"Creating commit {i}/{len(plan.commits)}: {c.message}")
+        made += gitops.commit(folder, c.message, c.files)
+    if not made and not info["ahead"]:
+        raise ValueError("Nothing to push.")
+    log(f"Pushing to {info['owner']}/{info['name']} ({plan.branch})")
+    gitops.push_branch(folder, info["clone_url"], plan.branch)
+    url = f"https://github.com/{info['owner']}/{info['name']}"
+    set_job(job_id, status="COMPLETED", github_url=url, commits=made + info["ahead"], completed_at=datetime.utcnow(), error=None)
+    events.emit(job_id, "push", "completed", url)
 
 
 def run_push(job_id: str) -> None:
@@ -203,14 +275,18 @@ def run_push(job_id: str) -> None:
     try:
         with SessionLocal() as db:
             job = db.get(Job, job_id)
-            plan, folder_raw = Plan.model_validate_json(job.plan_json), job.folder
+        plan = Plan.model_validate_json(job.plan_json)
+        update = job.mode == "update"
         log("Validating folder")
-        folder = resolve_folder(folder_raw)
-        s = scan_folder(folder)
+        folder = resolve_folder(job.folder)
+        s = do_scan(job)
         _scans[job_id] = s
         allowed, blocked = sets(s)
-        plan = validate_plan(plan, allowed, blocked)
+        plan = validate_plan(plan, allowed, blocked, meta=set() if update else META_FILES, allow_empty=update)
         gitops.check_git()
+        if update:
+            push_update(job_id, folder, plan, log)
+            return
         gitops.init_repo(folder)
         log("Git initialized")
         meta = gitops.write_meta(folder, plan, blocked)
