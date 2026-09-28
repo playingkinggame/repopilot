@@ -29,7 +29,7 @@ export default function Push() {
       {job?.status === "FAILED" && <ErrorBox>{job.error}</ErrorBox>}
       {job?.status === "COMPLETED" && job.github_url && (
         <Card>
-          <p className="flex items-center gap-2 font-medium"><CheckCircle2 size={18} className="text-ok" />Repository successfully published</p>
+          <p className="flex items-center gap-2 font-medium"><CheckCircle2 size={18} className="text-ok" />{job.mode === "update" ? "Changes pushed to GitHub" : "Repository successfully published"}</p>
           <a className="mt-3 inline-flex items-center gap-2 text-sm text-accent underline" href={job.github_url} target="_blank" rel="noreferrer">Open on GitHub <ExternalLink size={14} /></a>
         </Card>
       )}

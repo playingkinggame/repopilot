@@ -27,6 +27,8 @@ export default function Review() {
   }
 
   const blocked = job.security.blocked;
+  const update = job.mode === "update";
+  const st = new Map((job.sync?.changes ?? []).map((c) => [c.path, c.status]));
   const assigned = new Set(plan.commits.flatMap((c) => c.files));
   const unassigned = job.available_files.filter((f) => !assigned.has(f));
   const setCommit = (i: number, patch: Partial<Commit>) => setPlan({ ...plan, commits: plan.commits.map((c, j) => (j === i ? { ...c, ...patch } : c)) });
@@ -62,7 +64,15 @@ export default function Review() {
         </WarnBox>
       )}
       {plan.warnings.filter((w) => !w.includes("sensitive")).map((w) => <WarnBox key={w}>{w}</WarnBox>)}
-      <Card title="Repository">
+      {update && job.sync && (
+        <Card title="Sync target">
+          <p className="text-sm">Pushing changes to <span className="font-mono">{job.sync.owner}/{job.sync.name}</span></p>
+          <label className="mt-3 block text-sm">Branch<input className={`${inputCls} mt-1 font-mono`} value={plan.branch} onChange={(e) => setPlan({ ...plan, branch: e.target.value })} /></label>
+          {job.sync.ahead > 0 && <p className="mt-2 text-xs text-mute">{job.sync.ahead} commit(s) already made locally will be pushed too.</p>}
+          {plan.commits.length === 0 && <p className="mt-2 text-xs text-mute">No uncommitted changes. Only existing local commits will be pushed.</p>}
+        </Card>
+      )}
+      {!update && <Card title="Repository">
         <div className="grid gap-3 sm:grid-cols-2">
           <label className="text-sm">Name<input className={`${inputCls} mt-1`} value={plan.repo_name} onChange={(e) => setPlan({ ...plan, repo_name: e.target.value })} /></label>
           <label className="text-sm">Visibility
@@ -75,7 +85,7 @@ export default function Review() {
             <input className={`${inputCls} mt-1`} defaultValue={plan.topics.join(", ")} onBlur={(e) => setPlan({ ...plan, topics: e.target.value.split(",").map((t) => t.trim()).filter(Boolean) })} />
           </label>
         </div>
-      </Card>
+      </Card>}
       <Card title={`Commits (${plan.commits.length})`} action={<Button variant="ghost" onClick={() => setPlan({ ...plan, commits: [...plan.commits, { message: "chore: new commit", files: [], reason: "" }] })}><Plus size={14} />Add commit</Button>}>
         <div className="ml-2 space-y-4 border-l border-line pl-5">
           {plan.commits.map((c, i) => (
@@ -89,7 +99,7 @@ export default function Review() {
               <ul className="mt-2 space-y-1 font-mono text-xs">
                 {c.files.map((file) => (
                   <li key={file} className="flex items-center gap-2">
-                    <span className="flex-1 truncate">{file}</span>
+                    <span className="w-4 text-mute">{st.get(file) ?? ""}</span><span className="flex-1 truncate">{file}</span>
                     <select aria-label={`Move ${file}`} className="rounded border border-line bg-bg px-1 py-0.5" value="" onChange={(e) => e.target.value !== "" && move(i, file, Number(e.target.value))}>
                       <option value="">Move to…</option>
                       {plan.commits.map((o, j) => j !== i && <option key={j} value={j}>{o.message.slice(0, 40)}</option>)}
@@ -109,6 +119,7 @@ export default function Review() {
         </div>
         {unassigned.length > 0 && <p className="mt-3 text-xs text-mute">{unassigned.length} file(s) are not in any commit and will not be pushed.</p>}
       </Card>
+      {!update && <>
       <Card title="README.md" action={<Button variant="ghost" onClick={() => setPreview(!preview)}>{preview ? "Edit" : "Preview"}</Button>}>
         {preview ? <div className="md text-sm"><ReactMarkdown>{plan.readme}</ReactMarkdown></div>
           : <textarea aria-label="README" rows={12} className={`${inputCls} font-mono`} value={plan.readme} onChange={(e) => setPlan({ ...plan, readme: e.target.value })} />}
@@ -119,10 +130,11 @@ export default function Review() {
           <option value="MIT">MIT</option><option value="none">No license</option>
         </select>
       </Card>
+      </>}
       {err && <ErrorBox>{err}</ErrorBox>}
       <div className="flex items-center gap-4">
         {blocked.length > 0 && <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={ack} onChange={(e) => setAck(e.target.checked)} />I understand the blocked files will not be pushed</label>}
-        <Button onClick={approve} disabled={busy || (blocked.length > 0 && !ack)}><ShieldAlert size={14} />{busy ? "Starting…" : "Approve & push"}</Button>
+        <Button onClick={approve} disabled={busy || (blocked.length > 0 && !ack)}><ShieldAlert size={14} />{busy ? "Starting…" : update ? "Approve & push changes" : "Approve & push"}</Button>
       </div>
     </div>
   );

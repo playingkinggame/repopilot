@@ -5,19 +5,21 @@ export const API_URL: string = import.meta.env.VITE_API_URL ?? "http://localhost
 export interface Commit { message: string; files: string[]; reason: string }
 export interface Plan {
   repo_name: string; description: string; topics: string[]; visibility: "public" | "private"; commits: Commit[];
-  readme: string; gitignore: string; license: "MIT" | "none"; warnings: string[];
+  readme: string; gitignore: string; license: "MIT" | "none"; warnings: string[]; branch: string;
 }
 export interface Finding { severity: string; file: string; line: number; type: string; message: string }
 export interface Job {
   id: string; folder: string; repo_name: string; description: string; visibility: string; status: string; commits: number;
-  created_at: string; completed_at: string | null; github_url: string | null; error: string | null;
+  created_at: string; completed_at: string | null; github_url: string | null; error: string | null; mode: "new" | "update";
 }
 export interface JobDetail extends Job {
   plan: Plan | null; security: { blocked: { path: string; reason: string }[]; findings: Finding[] }; available_files: string[];
+  sync: { owner: string; name: string; branch: string; ahead: number; changes: { path: string; status: string }[] } | null;
 }
+export interface Inspect { is_repo: boolean; reason?: string; owner?: string; name?: string; branch?: string; ahead?: number; changed?: number }
 export interface Settings { groq_model: string; max_agent_tool_calls: number; max_file_size_mb: number; groq_configured: boolean; github_configured: boolean }
 export interface JobEvent { phase: string; type: "log" | "plan_ready" | "completed" | "failed"; message: string }
-export interface NewJob { folder: string; repo_name: string; description: string; visibility: string }
+export interface NewJob { folder: string; repo_name: string; description: string; visibility: string; mode: "new" | "update" }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
@@ -48,6 +50,7 @@ export const api = {
   savePlan: (id: string, plan: Plan) => request<JobDetail>(`/api/jobs/${id}/plan`, { method: "PUT", body: JSON.stringify(plan) }),
   approve: (id: string, acknowledge_warnings: boolean) => post<Job>(`/api/jobs/${id}/approve`, { acknowledge_warnings }),
   push: (id: string) => post<Job>(`/api/jobs/${id}/push`),
+  inspect: (folder: string) => request<Inspect>(`/api/inspect?folder=${encodeURIComponent(folder)}`),
   settings: () => request<Settings>("/api/settings"),
 };
 
